@@ -1,0 +1,4 @@
+numpy>=1.26
+requests>=2.31
+soundcard>=0.4.4
+shazamio>=0.9
