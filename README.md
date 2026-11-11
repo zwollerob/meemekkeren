@@ -107,8 +107,13 @@ Groen met "hoort geluid" betekent dat er audio binnenkomt.
 
 - **Herkennen duurt een paar tellen**: er is 12 s audio nodig, plus een paar seconden voor
   Shazam. Bij een nieuw nummer verschijnt de tekst dus na zo'n 12–15 seconden.
-- **Niet elk nummer heeft een gesynchroniseerde tekst** op LRCLIB. Dan laat de app de gewone
-  tekst zien (als die er is) die je zelf kunt scrollen.
+- **Niet elk nummer heeft een gesynchroniseerde tekst** op LRCLIB (vooral minder bekende
+  Nederlandstalige nummers). De app gebruikt alleen teksten waarvan titel én artiest kloppen.
+  Een juiste tekst zonder tijdcodes gaat vóór een tekst van een ander nummer. Je kunt die
+  tekst dan zelf scrollen. Heeft LRCLIB niets, dan gebruikt de app de tekst die Shazam
+  meestuurt. In de onderbalk zie je welke tekst er gebruikt wordt.
+- **Ontbreekt de tekst met tijdcodes?** Je kunt hem zelf toevoegen op [lrclib.net](https://lrclib.net),
+  dan heeft iedereen er plezier van.
 - **Geluidsvolume**: de app luistert naar het digitale signaal, dus het werkt ook als je
   volume laag staat. Staat het volume in Windows op **gedempt**, dan komt er niets binnen.
 - **Bluetooth-headsets** met veel vertraging: gebruik `+`/`−` om bij te stellen.

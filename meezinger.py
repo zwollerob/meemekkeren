@@ -16,6 +16,7 @@ Sneltoetsen:  <- / ->  sync -/+ 0,25 s   |   0  sync resetten
 from __future__ import annotations
 
 import asyncio
+import difflib
 import io
 import json
 import os
@@ -23,6 +24,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 import wave
 import warnings
 from dataclasses import dataclass, field
@@ -41,6 +43,8 @@ SILENCE_PAUSE_AFTER = 1.5    # s stilte voordat de tekstklok pauzeert
 RETRY_SEARCHING = 4.0        # s tussen pogingen zolang er geen nummer herkend is
 RETRY_LOCKED = 15.0          # s tussen controles als er al een nummer loopt
 LYRICS_LEAD = 0.25           # toon regels iets vóór de tijd, zodat je kan inzetten
+MATCH_TITLE_MIN = 0.75       # minimale overeenkomst titel (0..1) voor een songtekst
+MATCH_ARTIST_MIN = 0.6       # minimale overeenkomst artiest (0..1)
 USER_AGENT = "Meezinger/1.0 (desktop karaoke app)"
 
 
@@ -314,6 +318,46 @@ def _clean_artist(artist: str) -> str:
     return re.split(r"\s*(?:,|&| feat\.? | ft\.? | x | and )\s*", artist, maxsplit=1, flags=re.I)[0].strip()
 
 
+def _norm(text: str) -> str:
+    """Kleine letters, zonder accenten, haakjes en leestekens (voor vergelijken)."""
+    text = (text or "").translate(str.maketrans({"ø": "o", "Ø": "o", "æ": "ae", "Æ": "ae",
+                                                  "ß": "ss", "ł": "l", "Ł": "l"}))
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    text = re.sub(r"[\(\[].*?[\)\]]", " ", text)
+    text = text.replace("&", " en ").replace("'", "")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
+def _similar(a: str, b: str) -> float:
+    a, b = _norm(a), _norm(b)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:  # bv. "Zoutelande" vs "Zoutelande - Live"
+        return 0.9
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _artists(artist: str) -> list[str]:
+    parts = re.split(r"\s*(?:,|&|\+| feat\.? | ft\.? | x | en | and | met )\s*", artist or "", flags=re.I)
+    return [p for p in (x.strip() for x in parts) if p]
+
+
+def _match_score(item: dict, title: str, artist: str) -> float:
+    """0..1: hoe goed past dit LRCLIB-resultaat bij het herkende nummer? 0 = niet."""
+    t = max(_similar(item.get("trackName", ""), title),
+            _similar(item.get("trackName", ""), _clean_title(title)))
+    wanted = _artists(artist) or [artist]
+    found = _artists(item.get("artistName", "")) or [item.get("artistName", "")]
+    a = max(max(_similar(w, f) for w in wanted for f in found),
+            _similar(item.get("artistName", ""), artist))
+    if t < MATCH_TITLE_MIN or a < MATCH_ARTIST_MIN:
+        return 0.0
+    return 0.6 * t + 0.4 * a
+
+
 @dataclass
 class Lyrics:
     synced: list[tuple[float, str]] = field(default_factory=list)
@@ -324,20 +368,28 @@ class Lyrics:
 _lyrics_cache: dict[tuple[str, str], Lyrics] = {}
 
 
-def fetch_lyrics(title: str, artist: str) -> Lyrics:
+def fetch_lyrics(title: str, artist: str, shazam_text: str = "") -> Lyrics:
+    """Zoekt de songtekst op LRCLIB.
+
+    Alleen resultaten waarvan titel ÉN artiest overeenkomen tellen mee. Een juiste tekst
+    zonder tijdcodes gaat altijd vóór een tekst met tijdcodes van een ander nummer.
+    `shazam_text` (de tekst die Shazam zelf meestuurt) is de laatste terugvaloptie.
+    """
     key = (title.lower(), artist.lower())
     if key in _lyrics_cache:
         return _lyrics_cache[key]
 
     session = requests.Session()
     session.headers["User-Agent"] = USER_AGENT
+    ct, ca = _clean_title(title), _clean_artist(artist)
     queries = [
-        {"track_name": _clean_title(title), "artist_name": _clean_artist(artist)},
-        {"q": f"{_clean_artist(artist)} {_clean_title(title)}"},
-        {"track_name": _clean_title(title)},
+        {"track_name": ct, "artist_name": ca},
+        {"q": f"{ca} {ct}"},
+        {"track_name": ct},   # artiest wordt hieronder alsnog gecontroleerd
     ]
-    want = _clean_title(title).lower()
-    best_plain = ""
+    seen: set = set()
+    best_synced: tuple[float, dict] | None = None
+    best_plain: tuple[float, dict] | None = None
     for params in queries:
         try:
             r = session.get("https://lrclib.net/api/search", params=params, timeout=10)
@@ -345,22 +397,43 @@ def fetch_lyrics(title: str, artist: str) -> Lyrics:
             results = r.json()
         except Exception:
             continue
-        # liefst: gesynchroniseerd + titel die exact overeenkomt
-        results.sort(key=lambda x: (not x.get("syncedLyrics"),
-                                    (x.get("trackName") or "").lower() != want))
         for item in results:
-            if item.get("syncedLyrics"):
-                lyr = Lyrics(synced=parse_lrc(item["syncedLyrics"]),
-                             plain=item.get("plainLyrics") or "",
-                             source="LRCLIB (gesynchroniseerd)")
-                if lyr.synced:
-                    _lyrics_cache[key] = lyr
-                    return lyr
-            if not best_plain and item.get("plainLyrics"):
-                best_plain = item["plainLyrics"]
-    lyr = Lyrics(plain=best_plain, source="LRCLIB (niet gesynchroniseerd)" if best_plain else "")
+            if item.get("id") in seen or item.get("instrumental"):
+                continue
+            seen.add(item.get("id"))
+            score = _match_score(item, title, artist)
+            if score <= 0:
+                continue
+            if item.get("syncedLyrics") and (best_synced is None or score > best_synced[0]):
+                best_synced = (score, item)
+            if item.get("plainLyrics") and (best_plain is None or score > best_plain[0]):
+                best_plain = (score, item)
+        if best_synced and best_synced[0] >= 0.95:
+            break  # perfecte match gevonden, verder zoeken is niet nodig
+
+    lyr = Lyrics()
+    if best_synced:
+        item = best_synced[1]
+        synced = parse_lrc(item["syncedLyrics"])
+        if synced:
+            lyr = Lyrics(synced=synced, plain=item.get("plainLyrics") or "",
+                         source=f"LRCLIB (gesynchroniseerd): {item.get('artistName')} – {item.get('trackName')}")
+    if not lyr.synced and best_plain:
+        item = best_plain[1]
+        lyr = Lyrics(plain=item["plainLyrics"],
+                     source=f"LRCLIB (zonder tijdcodes): {item.get('artistName')} – {item.get('trackName')}")
+    if not lyr.synced and not lyr.plain and shazam_text.strip():
+        lyr = Lyrics(plain=shazam_text.strip(), source="Shazam (zonder tijdcodes)")
     _lyrics_cache[key] = lyr
     return lyr
+
+
+def shazam_lyrics_text(track: dict) -> str:
+    """De (ongesynchroniseerde) tekst die Shazam soms in zijn antwoord meestuurt."""
+    for section in track.get("sections") or []:
+        if section.get("type") == "LYRICS" and section.get("text"):
+            return "\n".join(section["text"])
+    return ""
 
 
 # ----------------------------------------------------------------------------
@@ -525,14 +598,15 @@ class Engine:
         with self._lock:
             self.track, self.lyrics = new, None
         self._set_status("📝  Songtekst ophalen…")
-        lyrics = await asyncio.to_thread(fetch_lyrics, new.title, new.artist)
+        lyrics = await asyncio.to_thread(fetch_lyrics, new.title, new.artist,
+                                         shazam_lyrics_text(track))
         with self._lock:
             if self.track is new:
                 self.lyrics = lyrics
         if lyrics.synced:
             self._set_status(f"🎤  {lyrics.source}")
         elif lyrics.plain:
-            self._set_status("Alleen ongesynchroniseerde tekst gevonden")
+            self._set_status(f"📄  {lyrics.source}")
         else:
             self._set_status("Geen songtekst gevonden voor dit nummer")
 
